@@ -1,6 +1,7 @@
 package org.example;
 
 import org.xbill.DNS.ARecord;
+import org.xbill.DNS.AAAARecord;
 import org.xbill.DNS.Message;
 import org.xbill.DNS.Name;
 import org.xbill.DNS.Record;
@@ -85,26 +86,27 @@ public class Socks5Proxy {
     private static void initChannels(int port) throws IOException {
         dnsChannel = DatagramChannel.open();
         dnsChannel.configureBlocking(false);
-        dnsChannel.bind(null); 
-        dnsChannel.register(selector, SelectionKey.OP_READ); //канал имеет данные для чтения
+        dnsChannel.bind(null);
+        dnsChannel.register(selector, SelectionKey.OP_READ);
         System.out.println("DNS resolver: " + dnsResover);
 
         serverChannel = ServerSocketChannel.open();
         serverChannel.configureBlocking(false);
         serverChannel.bind(new InetSocketAddress(port));
-        serverChannel.register(selector, SelectionKey.OP_ACCEPT); //сервер готов к подключению
+        serverChannel.register(selector, SelectionKey.OP_ACCEPT);
+        System.out.printf("server started on port %d%n", port);
     }
 
     private static void initDnsResolver() {
-        List<InetSocketAddress> servers = ResolverConfig.getCurrentConfig().servers();
-        for (InetSocketAddress serv: servers) {
-            InetAddress inetAddress = serv.getAddress();
-            if (inetAddress instanceof Inet4Address) {
-                dnsResover = new InetSocketAddress(inetAddress, serv.getPort() > 0 ? serv.getPort() : 53);
-                System.out.println("DNS resolver is taken: " + inetAddress);
-                return;
-            }
-        }
+//        List<InetSocketAddress> servers = ResolverConfig.getCurrentConfig().servers();
+//        for (InetSocketAddress serv: servers) {
+//            InetAddress inetAddress = serv.getAddress();
+//            if (inetAddress instanceof Inet4Address) {
+//                dnsResover = new InetSocketAddress(inetAddress, serv.getPort() > 0 ? serv.getPort() : 53);
+//                System.out.println("DNS resolver is taken: " + inetAddress);
+//                return;
+//            }
+//        }
         System.out.println("the default DNS resolver is taken");
     }
 
@@ -178,32 +180,39 @@ public class Socks5Proxy {
         clientKey.attach(connection);
         channelsConnection.put(client, connection);
         connection.state = Connection.State.AUTHENITICATION;
+        SocketAddress remoteAddr = client.getRemoteAddress();
+        System.out.printf("accepted new client: %s%n", remoteAddr);
     }
 
-    //нам надо как то просигналить если у нас не получилось распарсить dns response
     private static void handleDnsResponse() throws IOException {
         ByteBuffer buffer = ByteBuffer.allocate(SIZE_BUFFER);
-        if (dnsChannel.receive(buffer) == null) {
+        SocketAddress addr = dnsChannel.receive(buffer);
+        if (addr == null) {
             return;
         }
         buffer.flip();
 
         Message response;
         try {
-            response = new Message(buffer);
+            byte[] data = new byte[buffer.remaining()];
+            buffer.get(data);
+            response = new Message(data);
         } catch (IOException e) {
             System.err.println("Failed to parse DNS response: " + e.getMessage());
             return;
         }
 
         int id = response.getHeader().getID();
+        System.out.printf("dns response received id=%d from %s%n", id, addr);
         DnsRequestResolve dnsReqRes = dnsMap.remove(id);
         if (dnsReqRes == null) {
+            System.out.printf("no pending dns request for id=%d%n", id);
             return;
         }
 
         Connection conn = dnsReqRes.conn;
         if (conn == null || conn.state != Connection.State.RESOLVING) {
+            System.out.printf("connection is not resolving for id=%d%n", id);
             return;
         }
 
@@ -213,15 +222,19 @@ public class Socks5Proxy {
             if (rec instanceof ARecord) {
                 inetAddress = ((ARecord) rec).getAddress();
                 break;
+            } else if (rec instanceof AAAARecord) {
+                inetAddress = ((AAAARecord) rec).getAddress();
+                break;
             }
         }
 
         if (inetAddress == null) {
+            System.out.printf("dns resolution failed for name=%s id=%d%n", dnsReqRes.name, id);
             sendError(conn.client, SocksReplyCodes.REP_HOST_UNREACHABLE);
             conn.close();
-            removeConnectionHashMaps(conn);
             return;
         }
+        System.out.printf("dns resolved %s -> %s (id=%d)%n", dnsReqRes.name, inetAddress.getHostAddress(), id);
         conn.ipAddress = inetAddress;
 
         try {
@@ -241,6 +254,7 @@ public class Socks5Proxy {
         try {
             if (sc.finishConnect()) {
                 key.interestOps(SelectionKey.OP_READ);
+                System.out.printf("remote connected: %s%n", sc.getRemoteAddress());
                 if (conn.client != null && conn.state != Connection.State.CLOSED) {
                     sendSocksSuccess(conn.client, conn.ipAddress != null ? conn.ipAddress :
                             InetAddress.getByAddress(new byte[]{0,0,0,0}), conn.port);
@@ -248,6 +262,7 @@ public class Socks5Proxy {
                 }
             }
         } catch (IOException e) {
+            System.out.printf("remote connect failed: %s%n", e.getMessage());
             sendError(conn.client, SocksReplyCodes.REP_CONNECTION_REFUSED);
             conn.close();
             removeConnectionHashMaps(conn);
@@ -269,6 +284,7 @@ public class Socks5Proxy {
         if (conn.state == Connection.State.AUTHENITICATION || conn.state == Connection.State.REQUEST) {
             read = conn.client.read(conn.bufferConnection);
             if (read == -1) {
+                System.out.printf("client closed during handshake: %s%n", conn.client.getRemoteAddress());
                 conn.close();
                 removeConnectionHashMaps(conn);
                 return;
@@ -283,6 +299,8 @@ public class Socks5Proxy {
                 if (clientKey != null) {
                     clientKey.interestOps(clientKey.interestOps() & ~SelectionKey.OP_READ);
                 }
+            } else if (read > 0) {
+                System.out.printf("read %d bytes from client%n", read);
             }
             conn.clientToRemote.flip();
             if (conn.remote != null) {
@@ -298,6 +316,7 @@ public class Socks5Proxy {
     private static void handleReadFromRemote(Connection conn) throws IOException {
         int r = conn.remote.read(conn.remoteToClient);
         if (r == -1) {
+            System.out.printf("remote closed connection: %s%n", conn.remote.getRemoteAddress());
             SelectionKey remoteKey = conn.remote.keyFor(selector);
             if (remoteKey != null) {
                 remoteKey.interestOps(remoteKey.interestOps() & ~SelectionKey.OP_READ);
@@ -307,6 +326,7 @@ public class Socks5Proxy {
                 clientKey.interestOps(clientKey.interestOps() | SelectionKey.OP_WRITE);
             }
         } else if (r > 0) {
+            System.out.printf("read %d bytes from remote%n", r);
             conn.remoteToClient.flip();
             SelectionKey clientKey = conn.client.keyFor(selector);
             if (clientKey != null) {
@@ -324,16 +344,18 @@ public class Socks5Proxy {
 
         if (sc == conn.client) {
             conn.remoteToClient.flip();
-            conn.client.write(conn.remoteToClient);
+            int written = conn.client.write(conn.remoteToClient);
             conn.remoteToClient.compact();
+            System.out.printf("wrote %d bytes to client%n", written);
             if (conn.remoteToClient.position() == 0) {
                 key.interestOps(key.interestOps() & ~SelectionKey.OP_WRITE);
             }
 
         } else {
             conn.clientToRemote.flip();
-            conn.remote.write(conn.clientToRemote);
+            int written = conn.remote.write(conn.clientToRemote);
             conn.clientToRemote.compact();
+            System.out.printf("wrote %d bytes to remote%n", written);
             if (conn.clientToRemote.position() == 0) {
                 key.interestOps(key.interestOps() & ~SelectionKey.OP_WRITE);
             }
@@ -367,9 +389,9 @@ public class Socks5Proxy {
                 noAuth = true;
             }
         }
-        //proxy -> client
         ByteBuffer response = ByteBuffer.wrap(new byte[]{0x05, (noAuth ? 0x00 : (byte)0xFF)});
         conn.client.write(response);
+        System.out.printf("auth version=%d methods=%d noAuth=%b%n", version, nmethods, noAuth);
         if (!noAuth) {
             conn.close();
             removeConnectionHashMaps(conn);
@@ -384,6 +406,7 @@ public class Socks5Proxy {
             byte cmd = buffer.get();
             byte rsv = buffer.get();
             byte atyp = buffer.get();
+            System.out.printf("request ver=%d cmd=0x%02x atyp=0x%02x%n", ver, cmd, atyp);
             if (ver != 0x05) {
                 sendError(conn.client, SocksReplyCodes.REP_GENERAL_FAILURE);
                 conn.close();
@@ -406,6 +429,7 @@ public class Socks5Proxy {
                 int port = ((buffer.get() & 0xFF) << 8) | (buffer.get() & 0xFF);
                 conn.port = port;
                 conn.ipAddress = InetAddress.getByAddress(ip);
+                System.out.printf("request target ip=%s port=%d%n", conn.ipAddress.getHostAddress(), conn.port);
                 startRemoteConnect(conn);
                 conn.state = Connection.State.CONNECTING;
             } else if (atyp == 0x03) {
@@ -424,6 +448,7 @@ public class Socks5Proxy {
                 int port = ((buffer.get() & 0xFF) << 8) | (buffer.get() & 0xFF);
                 conn.port = port;
                 conn.nameResolveDns = name;
+                System.out.printf("request target name=%s port=%d%n", name, port);
                 startDnsResolve(conn, name);
                 conn.state = Connection.State.RESOLVING;
             } else {
@@ -446,22 +471,24 @@ public class Socks5Proxy {
         conn.remote = remote;
         channelsConnection.put(remote, conn);
         remote.register(selector, SelectionKey.OP_CONNECT, conn);
+        System.out.printf("start connecting to remote: %s%n", remoteAddr);
     }
 
     private static void startDnsResolve(Connection conn, String nameString) {
         try {
-        Message message = new Message();
-        int id;
-        do {
-            id = rand.nextInt(0xFF);
-        } while (dnsMap.containsKey(id));
-        message.getHeader().setID(id);
+            Message message = new Message();
+            int id;
+            do {
+                id = rand.nextInt(0xFF);
+            } while (dnsMap.containsKey(id));
+            message.getHeader().setID(id);
             Name name = Name.fromString(nameString + ".");
             Record record = Record.newRecord(name, Type.A, DClass.IN);
             message.addRecord(record, Section.QUESTION);
             ByteBuffer buf = ByteBuffer.wrap(message.toWire());
             dnsChannel.send(buf, dnsResover);
             dnsMap.put(id, new DnsRequestResolve(id, conn, nameString));
+            System.out.printf("sent dns request id=%d name=%s to %s%n", id, nameString, dnsResover);
         } catch (Exception e) {
             sendError(conn.client, SocksReplyCodes.REP_HOST_UNREACHABLE);
             conn.close();
@@ -473,16 +500,17 @@ public class Socks5Proxy {
     private static void sendError(SocketChannel client, byte rep) {
         try {
             ByteBuffer response = ByteBuffer.allocate(10);
-            response.put((byte)0x05); //ver
+            response.put((byte)0x05);
             response.put(rep);
-            response.put((byte)0x00); // rsv
-            response.put((byte)0x01); //atyp
+            response.put((byte)0x00);
+            response.put((byte)0x01);
             for (int i = 0; i < 4; i++) {
-                response.put((byte)0x00); //bnd.addr
+                response.put((byte)0x00);
             }
-            response.putShort((short)0); //bnd.port
+            response.putShort((short)0);
             response.flip();
             client.write(response);
+            System.out.printf("sent error rep=0x%02x to client%n", rep);
         } catch (IOException e) {
             System.err.println(e.getMessage());
         }
@@ -491,15 +519,17 @@ public class Socks5Proxy {
     private static void sendSocksSuccess(SocketChannel client, InetAddress boundAddr, int boundPort) {
         try {
             byte[] addrBytes = boundAddr != null ? boundAddr.getAddress() : new byte[]{0,0,0,0};
-            ByteBuffer response = ByteBuffer.allocate(10);
+            byte atyp = (addrBytes.length == 4) ? (byte)0x01 : (byte)0x04;
+            ByteBuffer response = ByteBuffer.allocate(4 + addrBytes.length + 2);
             response.put((byte)0x05);
             response.put(SocksReplyCodes.REP_SUCCEEDED);
-            response.put((byte)0x00); // rsv
-            response.put((byte)0x01); // ipv4
+            response.put((byte)0x00);
+            response.put(atyp);
             response.put(addrBytes);
             response.putShort((short)boundPort);
             response.flip();
             client.write(response);
+            System.out.printf("sent success bound=%s port=%d%n", boundAddr != null ? boundAddr.getHostAddress() : "0.0.0.0", boundPort);
         } catch (IOException e) {
             System.err.println(e.getMessage());
         }
@@ -516,6 +546,7 @@ public class Socks5Proxy {
                 dnsRequestResolve.conn.close();
                 removeConnectionHashMaps(dnsRequestResolve.conn);
                 toRemove.add(entry.getKey());
+                System.out.printf("dns request timeout id=%d name=%s%n", dnsRequestResolve.id, dnsRequestResolve.name);
             }
         }
         for (Integer id : toRemove) dnsMap.remove(id);
@@ -542,6 +573,7 @@ public class Socks5Proxy {
             if (dnsChannel != null && dnsChannel.isOpen()) dnsChannel.close();
             if (serverChannel != null && serverChannel.isOpen()) serverChannel.close();
             if (selector != null && selector.isOpen()) selector.close();
+            System.out.println("shutdown completed");
         } catch (IOException e) {
             System.err.println(e.getMessage());
         }
