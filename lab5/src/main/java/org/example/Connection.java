@@ -6,7 +6,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 
 public class Connection {
-    public static final int BUFFER_SIZE = 2 ^ 14;
+    public static final int BUFFER_SIZE = 65535;
 
     public SocketChannel client;
     public SocketChannel remote;
